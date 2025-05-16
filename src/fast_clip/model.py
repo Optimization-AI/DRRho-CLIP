@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import logging
 import math
 from typing import Optional, Tuple, Union
+from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -57,6 +58,7 @@ class CLIPTextCfg:
     ls_init_value: Optional[float] = None  # layer scale initial value
     hf_model_name: str = None
     hf_tokenizer_name: str = None
+    tokenizer_kwargs: Optional[dict] = None
     hf_model_pretrained: bool = True
     proj: str = 'mlp'
     pooler_type: str = 'mean_pooler'
@@ -266,6 +268,81 @@ class CLIP(nn.Module):
         if self.logit_bias is not None:
             return image_features, text_features, self.logit_scale.exp(), self.logit_bias
         return image_features, text_features, self.logit_scale.exp()
+
+
+# https://github.com/facebookresearch/SLIP/blob/main/models.py
+class SLIP(CLIP):
+    def __init__(self,
+                 embed_dim: int,
+                 ssl_mlp_dim: int,
+                 ssl_embed_dim: int,
+                 skip_image_masking: str = "",
+                 **kwargs,
+                 ):
+        super(SLIP, self).__init__(embed_dim=embed_dim, **kwargs)
+        logging.info("Using SLIP")
+
+        self.image_mlp = self._build_mlp(in_dim=embed_dim, mlp_dim=ssl_mlp_dim, out_dim=ssl_embed_dim)
+
+        self.skip_image_mask_bimodal = True if "bimodal" in skip_image_masking else False
+        self.skip_image_mask_unimodal = True if "unimodal" in skip_image_masking else False
+        if self.skip_image_mask_bimodal or self.skip_image_mask_unimodal:
+            assert isinstance(self.visual, VisionTransformer), ("Masking image patches is only supported"
+                                                                " for Vision Transformer")
+
+    def _build_mlp(self, in_dim, mlp_dim, out_dim):
+        return nn.Sequential(OrderedDict([
+            ("layer1", nn.Linear(in_dim, mlp_dim)),
+            ("bn1", nn.SyncBatchNorm(mlp_dim)),
+            ("relu1", nn.ReLU(inplace=True)),
+            ("layer2", nn.Linear(mlp_dim, mlp_dim)),
+            ("bn2", nn.SyncBatchNorm(mlp_dim)),
+            ("relu2", nn.ReLU(inplace=True)),
+            ("layer3", nn.Linear(mlp_dim, out_dim)),
+        ]))
+
+    def encode_image(self, image, normalize: bool = False, skip_patch_dropout: bool = False):
+        params_dict = {}
+        if skip_patch_dropout:
+            params_dict.update({"skip_patch_dropout": skip_patch_dropout})
+        features = self.visual(image, **params_dict)
+        return F.normalize(features, dim=-1) if normalize else features
+
+    def forward(self, image = None, text = None, aug1 = None, aug2 = None):
+        text_features = self.encode_text(text, normalize=True) if text is not None else None
+        if image is not None:
+            params_dict_bimodal = {}
+            if self.skip_image_mask_bimodal:
+                params_dict_bimodal.update({"skip_patch_dropout": True})
+            image_features = self.encode_image(image, normalize=True, **params_dict_bimodal)
+        else:
+            image_features = None
+        if aug1 is not None and aug2 is not None:
+            params_dict_unimodal = {}
+            if self.skip_image_mask_unimodal:
+                params_dict_unimodal.update({"skip_patch_dropout": True})
+            aug_image_features1 = F.normalize(self.image_mlp(self.visual(aug1, **params_dict_unimodal)), dim=-1)
+            aug_image_features2 = F.normalize(self.image_mlp(self.visual(aug2, **params_dict_unimodal)), dim=-1)
+        else:
+            aug_image_features1, aug_image_features2 = None, None
+
+        if self.output_dict:
+            out_dict = {
+                "image_features": image_features,
+                "text_features": text_features,
+                "logit_scale": self.logit_scale.exp(),
+                "aug_image_features1": aug_image_features1,
+                "aug_image_features2": aug_image_features2,
+            }
+            if self.logit_bias is not None:
+                out_dict['logit_bias'] = self.logit_bias
+            return out_dict
+
+        if self.logit_bias is not None:
+            return image_features, text_features, self.logit_scale.exp(), aug_image_features1,\
+                aug_image_features2, self.logit_bias
+        return image_features, text_features, self.logit_scale.exp(), aug_image_features1,\
+            aug_image_features2
 
 
 class CustomTextCLIP(nn.Module):

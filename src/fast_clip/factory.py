@@ -13,12 +13,13 @@ from .constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
 from .model import CLIP, CustomTextCLIP, convert_weights_to_lp, convert_to_custom_text_state_dict,\
     resize_pos_embed, get_cast_dtype
 from .coca_model import CoCa
-from .loss import ClipLoss, DistillClipLoss, CoCaLoss, SigLipLoss, FastCLIPLoss, FastCLIPLossIndividual
+from .loss import ClipLoss, DistillClipLoss, CoCaLoss, SigLipLoss, FastCLIPLoss, FastCLIPLossIndividual,\
+    SogCLRLoss
 from .openai import load_openai_model
 from .pretrained import is_pretrained_cfg, get_pretrained_cfg, download_pretrained,\
     list_pretrained_tags_by_model, download_pretrained_from_hf
 from .transform import image_transform, AugmentationCfg
-from .tokenizer import HFTokenizer, tokenize
+from .tokenizer import HFTokenizer, SimpleTokenizer, DEFAULT_CONTEXT_LENGTH
 
 
 HF_HUB_PREFIX = 'hf-hub:'
@@ -74,13 +75,54 @@ def get_model_config(model_name):
         return None
 
 
-def get_tokenizer(model_name):
+def _get_hf_config(model_id, cache_dir=None):
+    config_path = download_pretrained_from_hf(model_id, filename='open_clip_config.json', cache_dir=cache_dir)
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    return config
+
+
+def get_tokenizer(
+        model_name: str = '',
+        context_length: Optional[int] = None,
+        **kwargs,
+):
     if model_name.startswith(HF_HUB_PREFIX):
-        tokenizer = HFTokenizer(model_name[len(HF_HUB_PREFIX):])
+        model_name = model_name[len(HF_HUB_PREFIX):]
+        try:
+            config = _get_hf_config(model_name)['model_cfg']
+        except Exception:
+            tokenizer = HFTokenizer(
+                model_name,
+                context_length=context_length or DEFAULT_CONTEXT_LENGTH,
+                **kwargs,
+            )
+            return tokenizer
     else:
         config = get_model_config(model_name)
+        assert config is not None, f"No valid model config found for {model_name}."
+
+    text_config = config.get('text_cfg', {})
+    if 'tokenizer_kwargs' in text_config:
+        tokenizer_kwargs = dict(text_config['tokenizer_kwargs'], **kwargs)
+    else:
+        tokenizer_kwargs = kwargs
+
+    if context_length is None:
+        context_length = text_config.get('context_length', DEFAULT_CONTEXT_LENGTH)
+
+    if 'hf_tokenizer_name' in text_config:
         tokenizer = HFTokenizer(
-            config['text_cfg']['hf_tokenizer_name']) if 'hf_tokenizer_name' in config['text_cfg'] else tokenize
+            text_config['hf_tokenizer_name'],
+            context_length=context_length,
+            **tokenizer_kwargs,
+        )
+    else:
+        tokenizer = SimpleTokenizer(
+            context_length=context_length,
+            **tokenizer_kwargs,
+        )
+
     return tokenizer
 
 
@@ -157,6 +199,7 @@ def create_model(
             device=device,
             cache_dir=cache_dir,
         )
+        pretrained_cfg = get_pretrained_cfg(model_name, pretrained)
     else:
         model_cfg = model_cfg or get_model_config(model_name)
         if model_cfg is not None:
@@ -256,6 +299,12 @@ def create_model(
         model.visual.image_mean = pretrained_cfg.get('mean', None) or OPENAI_DATASET_MEAN
         model.visual.image_std = pretrained_cfg.get('std', None) or OPENAI_DATASET_STD
 
+    preprocess_cfg = {
+        "resize_mode": pretrained_cfg.get("resize_mode", None),
+        "interpolation": pretrained_cfg.get("interpolation", None),
+    }
+    model.visual.preprocess_cfg = preprocess_cfg
+
     if output_dict and hasattr(model, "output_dict"):
         model.output_dict = True
 
@@ -271,9 +320,11 @@ def create_loss(args):
             local_loss=args.local_loss,
             gather_with_grad=args.gather_with_grad,
             cache_labels=True,
-            rank=args.rank,
-            world_size=args.world_size,
             use_horovod=args.horovod,
+            dist_logit_scale=args.distill_logit_scale,
+            teacher_dimension=args.distill_teacher_dimension,
+            distill_loss_weights=[1.0 - args.distill_weight, args.distill_weight],
+            average_after_softmax=args.distill_average_after_softmax,
         )
     elif "coca" in args.model.lower():
         return CoCaLoss(
@@ -282,8 +333,6 @@ def create_loss(args):
             local_loss=args.local_loss,
             gather_with_grad=args.gather_with_grad,
             cache_labels=True,
-            rank=args.rank,
-            world_size=args.world_size,
             use_horovod=args.horovod,
         )
     elif args.siglip:
@@ -296,9 +345,10 @@ def create_loss(args):
         loss_args = {"data_size": args.data_size, "gamma": args.gamma, "device": torch.device(args.device),
                         "rho": args.rho, "gamma_schedule": args.gamma_schedule,
                         "gamma_decay_epochs": args.gamma_decay_epochs, "eps": args.fastclip_eps,
-                        "multiply_tau": args.multiply_tau}
+                        "multiply_tau": args.multiply_tau,
+                        "dist_loss_weight": args.distill_weight, "loss_weight": args.loss_weight}
         if "global" in args.temperature_scheme:
-            return FastCLIPLoss(**loss_args)
+            return SogCLRLoss(**loss_args)
         elif "individual" in args.temperature_scheme:
             loss_args.update({"tau_init": args.temperature, "lr_tau": args.lr_tau, "beta1_tau": args.beta1,
                               "beta2_tau": args.beta2, "eps_tau": args.eps})
@@ -309,8 +359,6 @@ def create_loss(args):
         local_loss=args.local_loss,
         gather_with_grad=args.gather_with_grad,
         cache_labels=True,
-        rank=args.rank,
-        world_size=args.world_size,
         use_horovod=args.horovod,
     )
 
@@ -332,6 +380,7 @@ def create_model_and_transforms(
         aug_cfg: Optional[Union[Dict[str, Any], AugmentationCfg]] = None,
         cache_dir: Optional[str] = None,
         output_dict: Optional[bool] = None,
+        rand_augment: bool = False,
         **model_kwargs,
 ):
     model = create_model(
@@ -359,12 +408,15 @@ def create_model_and_transforms(
         mean=image_mean,
         std=image_std,
         aug_cfg=aug_cfg,
+        rand_augment=rand_augment,
+        **model.visual.preprocess_cfg,
     )
     preprocess_val = image_transform(
         model.visual.image_size,
         is_train=False,
         mean=image_mean,
         std=image_std,
+        **model.visual.preprocess_cfg,
     )
 
     return model, preprocess_train, preprocess_val
@@ -409,6 +461,7 @@ def create_model_from_pretrained(
         is_train=False,
         mean=image_mean,
         std=image_std,
+        **model.visual.preprocess_cfg,
     )
 
     return model, preprocess

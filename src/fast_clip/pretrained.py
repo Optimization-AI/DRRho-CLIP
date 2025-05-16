@@ -8,6 +8,7 @@ from typing import Dict, Union
 from tqdm import tqdm
 
 from .version import __version__
+from .constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD, INCEPTION_MEAN, INCEPTION_STD
 
 try:
     from huggingface_hub import hf_hub_download
@@ -18,13 +19,30 @@ except ImportError:
     _has_hf_hub = False
 
 
-def _pcfg(url='', hf_hub='', mean=None, std=None):
-    return dict(
-        url=url,
-        hf_hub=hf_hub,
-        mean=mean,
-        std=std,
-    )
+def _pcfg(url='', hf_hub='', **kwargs):
+    # OpenAI / OpenCLIP defaults
+    return {
+        'url': url,
+        'hf_hub': hf_hub,
+        'mean': OPENAI_DATASET_MEAN,
+        'std': OPENAI_DATASET_STD,
+        'interpolation': 'bicubic',
+        'resize_mode': 'shortest',
+        **kwargs,
+    }
+
+
+def _slpcfg(url='', hf_hub='', **kwargs):
+    # SiGLIP defaults
+    return {
+        'url': url,
+        'hf_hub': hf_hub,
+        'mean': INCEPTION_MEAN,
+        'std': INCEPTION_STD,
+        'interpolation': 'bicubic',
+        'resize_mode': 'squash',
+        **kwargs,
+    }
 
 
 _RN50 = dict(
@@ -84,6 +102,8 @@ _VITB32 = dict(
     laion2b_e16=_pcfg(
         "https://github.com/mlfoundations/open_clip/releases/download/v0.2-weights/vit_b_32-laion2b_e16-af8dbd0c.pth"),
     laion2b_s34b_b79k=_pcfg(hf_hub='laion/CLIP-ViT-B-32-laion2B-s34B-b79K/'),
+    laion80m_s34b_b88k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-B-32_Data-80M_Samples-34B_lr-1e-3_bs-88k.pt'),
+    laion2b_s3b_b88k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-B-32_Data-2B_Samples-3B_lr-1e-3_bs-88k.pt'),
     # DataComp-XL models
     datacomp_xl_s13b_b90k=_pcfg(hf_hub='laion/CLIP-ViT-B-32-DataComp.XL-s13B-b90K/'),
     # DataComp-M models
@@ -111,6 +131,10 @@ _VITB32_quickgelu = dict(
         "https://github.com/mlfoundations/open_clip/releases/download/v0.2-weights/vit_b_32-quickgelu-laion400m_e31-d867053b.pt"),
     laion400m_e32=_pcfg(
         "https://github.com/mlfoundations/open_clip/releases/download/v0.2-weights/vit_b_32-quickgelu-laion400m_e32-46683a32.pt"),
+    metaclip_400m=_pcfg(
+        "https://dl.fbaipublicfiles.com/MMPT/metaclip/b32_400m.pt"),
+    metaclip_fullcc=_pcfg(
+        "https://dl.fbaipublicfiles.com/MMPT/metaclip/b32_fullcc2.5b.pt"),
 )
 
 _VITB32_256 = dict(
@@ -124,7 +148,16 @@ _VITB16 = dict(
         "https://github.com/mlfoundations/open_clip/releases/download/v0.2-weights/vit_b_16-laion400m_e31-00efa78f.pt"),
     laion400m_e32=_pcfg(
         "https://github.com/mlfoundations/open_clip/releases/download/v0.2-weights/vit_b_16-laion400m_e32-55e67d44.pt"),
-    laion2b_s34b_b88k=_pcfg(hf_hub='laion/CLIP-ViT-B-16-laion2B-s34B-b88K/'),
+    # laion2b_s34b_b88k=_pcfg(hf_hub='laion/CLIP-ViT-B-16-laion2B-s34B-b88K/'),
+    laion400m_s3b_b88k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-B-16_Data-400M_Samples-3B_lr-1e-3_bs-88k.pt'),
+    laion400m_s13b_b33k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-B-16_Data-400M_Samples-13B_lr-5e-4_bs-33k.pt'),
+    laion400m_s34b_b88k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-B-16_Data-400M_Samples-34B_lr-1e-3_bs-88k.pt'),
+    laion80m_s3b_b88k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-B-16_Data-80M_Samples-3B_lr-1e-3_bs-88k.pt'),
+    laion80m_s13b_b88k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-B-16_Data-80M_Samples-13B_lr-1e-3_bs-88k.pt'),
+    laion80m_s34b_b88k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-B-16_Data-80M_Samples-34B_lr-1e-3_bs-88k.pt'),
+    laion2b_s3b_b88k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-B-16_Data-2B_Samples-3B_lr-1e-3_bs-88k.pt'),
+    laion2b_s13b_b88k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-B-16_Data-2B_Samples-13B_lr-1e-3_bs-88k.pt'),
+    laion2b_s34b_b88k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-B-16_Data-2B_Samples-34B_lr-1e-3_bs-88k.pt'),
     # DataComp-XL models
     datacomp_xl_s13b_b90k=_pcfg(hf_hub='laion/CLIP-ViT-B-16-DataComp.XL-s13B-b90K/'),
     # DataComp-L models
@@ -135,6 +168,15 @@ _VITB16 = dict(
     commonpool_l_text_s1b_b8k=_pcfg(hf_hub='laion/CLIP-ViT-B-16-CommonPool.L.text-s1B-b8K/'),
     commonpool_l_basic_s1b_b8k=_pcfg(hf_hub='laion/CLIP-ViT-B-16-CommonPool.L.basic-s1B-b8K/'),
     commonpool_l_s1b_b8k=_pcfg(hf_hub='laion/CLIP-ViT-B-16-CommonPool.L-s1B-b8K/'),
+    # DFN
+    dfn2b=_pcfg(hf_hub='apple/DFN2B-CLIP-ViT-B-16/'),
+)
+
+_VITB16_quickgelu = dict(
+    metaclip_400m=_pcfg(
+        "https://dl.fbaipublicfiles.com/MMPT/metaclip/b16_400m.pt"),
+    metaclip_fullcc=_pcfg(
+        "https://dl.fbaipublicfiles.com/MMPT/metaclip/b16_fullcc2.5b.pt"),
 )
 
 _VITB16_PLUS_240 = dict(
@@ -154,11 +196,24 @@ _VITL14 = dict(
     laion2b_s32b_b82k=_pcfg(
         hf_hub='laion/CLIP-ViT-L-14-laion2B-s32B-b82K/',
         mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+    laion2b_s13b_b86k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-L-14_Data-2B_Samples-13B_lr-1e-3_bs-86k.pt'),
+    laion400m_s13b_b86k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-L-14_Data-400M_Samples-13B_lr-1e-3_bs-86k.pt'),
+    laion80m_s13b_b88k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-L-14_Data-80M_Samples-13B_lr-1e-3_bs-88k.pt'),
+    laion80m_s34b_b88k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-L-14_Data-80M_Samples-34B_lr-1e-3_bs-88k.pt'),
+    laion2b_s3b_b88k=_pcfg('https://huggingface.co/laion/scaling-laws-openclip/resolve/main/Model-L-14_Data-2B_Samples-3B_lr-1e-3_bs-88k.pt'),
     # DataComp-XL models
     datacomp_xl_s13b_b90k=_pcfg(hf_hub='laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K/'),
     commonpool_xl_clip_s13b_b90k=_pcfg(hf_hub='laion/CLIP-ViT-L-14-CommonPool.XL.clip-s13B-b90K/'),
     commonpool_xl_laion_s13b_b90k=_pcfg(hf_hub='laion/CLIP-ViT-L-14-CommonPool.XL.laion-s13B-b90K/'),
     commonpool_xl_s13b_b90k=_pcfg(hf_hub='laion/CLIP-ViT-L-14-CommonPool.XL-s13B-b90K/'),
+)
+
+_VITL14_quickgelu = dict(
+    metaclip_400m=_pcfg(
+        "https://dl.fbaipublicfiles.com/MMPT/metaclip/l14_400m.pt"),
+    metaclip_fullcc=_pcfg(
+        "https://dl.fbaipublicfiles.com/MMPT/metaclip/l14_fullcc2.5b.pt"),
+    dfn2b=_pcfg(hf_hub='apple/DFN2B-CLIP-ViT-L-14/'),
 )
 
 _VITL14_336 = dict(
@@ -168,6 +223,23 @@ _VITL14_336 = dict(
 
 _VITH14 = dict(
     laion2b_s32b_b79k=_pcfg(hf_hub='laion/CLIP-ViT-H-14-laion2B-s32B-b79K/'),
+)
+
+_VITH14_quickgelu = dict(
+    metaclip_fullcc=_pcfg("https://dl.fbaipublicfiles.com/MMPT/metaclip/h14_fullcc2.5b.pt"),
+    dfn5b=_pcfg(
+        hf_hub='apple/DFN5B-CLIP-ViT-H-14/',
+        interpolation="bicubic",
+        resize_mode="squash"
+    ),
+)
+
+_VITH14_378_quickgelu = dict(
+    dfn5b=_pcfg(
+        hf_hub='apple/DFN5B-CLIP-ViT-H-14-378/',
+        interpolation="bicubic",
+        resize_mode="squash"
+    ),
 )
 
 _VITg14 = dict(
@@ -244,10 +316,14 @@ _PRETRAINED = {
     "ViT-B-32-256": _VITB32_256,
     "ViT-B-32-quickgelu": _VITB32_quickgelu,
     "ViT-B-16": _VITB16,
+    "ViT-B-16-quickgelu": _VITB16_quickgelu,
     "ViT-B-16-plus-240": _VITB16_PLUS_240,
     "ViT-L-14": _VITL14,
+    "ViT-L-14-quickgelu": _VITL14_quickgelu,
     "ViT-L-14-336": _VITL14_336,
     "ViT-H-14": _VITH14,
+    "ViT-H-14-quickgelu": _VITH14_quickgelu,
+    "ViT-H-14-378-quickgelu": _VITH14_378_quickgelu,
     "ViT-g-14": _VITg14,
     "ViT-bigG-14": _VITbigG14,
     "roberta-ViT-B-32": _robertaViTB32,
@@ -288,7 +364,13 @@ _PRETRAINED = {
     "EVA02-E-14-plus": dict(
         # from QuanSun/EVA-CLIP/EVA02_CLIP_E_psz14_plus_s9B.pt
         laion2b_s9b_b144k=_pcfg(hf_hub='timm/eva02_enormous_patch14_plus_clip_224.laion2b_s9b_b144k/'),
-    )
+    ),
+    "ViT-SO400M-14-SigLIP": dict(
+        webli=_slpcfg(hf_hub='timm/ViT-SO400M-14-SigLIP/'),
+    ),
+    "ViT-SO400M-14-SigLIP-384": dict(
+        webli=_slpcfg(hf_hub='timm/ViT-SO400M-14-SigLIP-384/'),
+    ),
 }
 
 

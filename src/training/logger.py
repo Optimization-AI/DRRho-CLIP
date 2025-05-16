@@ -1,4 +1,6 @@
 import logging
+import sys
+import traceback
 
 
 def setup_logging(log_file, level, include_host=False):
@@ -24,3 +26,6 @@ def setup_logging(log_file, level, include_host=False):
         file_handler.setFormatter(formatter)
         logging.root.addHandler(file_handler)
 
+    def exc_handler(exctype, value, tb):
+        logging.root.exception(''.join(traceback.format_exception(exctype, value, tb)))
+    sys.excepthook = exc_handler

@@ -4,6 +4,7 @@ import braceexpand
 from dataclasses import dataclass
 from multiprocessing import Value
 import functools
+import glob
 
 import numpy as np
 import pandas as pd
@@ -13,10 +14,8 @@ import webdataset as wds
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler
 from torch.utils.data.distributed import DistributedSampler
-try:
-    from libauc.datasets.webdataset import WebDataset
-except ModuleNotFoundError:
-    from webdata import WebDataset
+
+from .webdata import WebDataset, pytorch_local_worker_info
 
 try:
     import horovod.torch as hvd
@@ -117,7 +116,14 @@ def get_imagenet(args, preprocess_fns, split):
 
 def expand_urls(urls, weights=None):
     if weights is None:
-        expanded_urls = wds.shardlists.expand_urls(urls)
+        wds_expanded_urls = wds.shardlists.expand_urls(urls)
+        # wds.shardlists.expand_urls leverages braceexpand, which does not support wildcards
+        expanded_urls = []
+        for url in wds_expanded_urls:
+            if '*' in url:
+                expanded_urls.extend(glob.glob(url))
+            else:
+                expanded_urls.append(url)
         return expanded_urls, None
     if isinstance(urls, str):
         urllist = urls.split("::")
@@ -137,28 +143,109 @@ def expand_urls(urls, weights=None):
         return all_urls, weights
 
 
-def get_wds_dataset(args, preprocess_img, is_train, epoch=0, tokenizer=None):
+def extract_data_index(data_url: str):
+    index = -1
+    try:
+        index = int(data_url.split('/')[-1].split('.')[0])
+    except:
+        pass
+    return index
+
+
+def build_cached_data_index(cached_dir):
+    cached_data_index = None
+    if cached_dir:
+        cached_data_list = expand_urls(cached_dir)[0]
+        if len(cached_data_list) > 0:
+            cached_data_list.sort(key=extract_data_index)
+            max_data_id = extract_data_index(cached_data_list[-1])
+            cached_data_index = ['' for _ in range(max_data_id + 1)]
+            for cached_data in cached_data_list:
+                id = extract_data_index(cached_data)
+                cached_data_index[id] = cached_data
+    return cached_data_index
+
+
+def get_wds_dataset(args, preprocess_fns, is_train, epoch=0, tokenizer=None):
     input_shards = args.train_data if is_train else args.val_data
-    num_samples = args.train_num_samples if is_train else args.val_num_samples or 0
+    preprocess_train, preprocess_val = preprocess_fns
+    preprocess_img = preprocess_train if is_train else preprocess_val
     return_index = True
+
+    shards_list = expand_urls(input_shards)[0]
+    shards_list.sort(key=extract_data_index)
+    shards_id_list = None
+    if args.cache_ref_model_features or args.cache_syn_texts:
+        preprocess_img = preprocess_val
+        if args.ref_features_offset < 0:
+            args.ref_features_offset = extract_data_index(shards_list[0]) * args.num_samples_per_shard
+        if args.syn_texts_offset < 0:
+            args.syn_texts_offset = extract_data_index(shards_list[0]) * args.num_samples_per_shard
+        if args.cache_group_size > 1:
+            assert args.world_size == 1, "World size must be 1 if cache_group_size is specified"
+            group_size = args.cache_group_size
+            rank = args.cache_rank
+        else:
+            group_size = args.world_size
+            rank = args.rank
+        shards_list_rank = []
+        num_shards_per_rank = (len(shards_list) + group_size - 1) // group_size
+        for i in range(group_size):
+            shards_list_rank.append(shards_list[i * num_shards_per_rank: min(len(shards_list), (i+ 1) * num_shards_per_rank)])
+        shards_list = shards_list_rank[rank]
+        shards_id_list = [extract_data_index(shard) for shard in shards_list]
+        args.data_size = len(shards_list) * args.num_samples_per_shard
+        args.train_num_samples = args.data_size
+        args.ref_features_offset = args.ref_features_offset + rank * num_shards_per_rank * args.num_samples_per_shard
+        args.syn_texts_offset = args.syn_texts_offset + rank * num_shards_per_rank * args.num_samples_per_shard
+        logging.info("Using validation image augmentation for caching.")
+    logging.info((f"Length of expanded urls: {len(shards_list)}, "
+                  f"smallest shard id: {extract_data_index(shards_list[0])}, "
+                  f"largest shard id: {extract_data_index(shards_list[-1])}"))
+
+    num_samples = args.train_num_samples if is_train else args.val_num_samples or 0
 
     def tokenize(tokenizer, text):
         return tokenizer(text)[0]
 
-    dataset = WebDataset(input_shards, is_train, args.batch_size, preprocess_img, args.seed, epoch,
+    if not args.skip_webdataset_split_by_node:
+        rank, world_size, _, _ = wds.utils.pytorch_worker_info()
+        logging.info(f"Rank {rank} in a {world_size}-GPU group is training on {len(shards_list)} shards: {input_shards}")
+    else:
+        local_rank, local_world_size = pytorch_local_worker_info()
+        logging.info(f"Rank {local_rank} in a {local_world_size}-GPU group is training on {len(shards_list)} shards: {input_shards}")
+    if args.cache_ref_model_features:
+        cached_ref_features_index = None
+    else:
+        cached_ref_features_index = build_cached_data_index(args.cached_ref_features_dir)
+    if args.cache_syn_texts:
+        cached_syn_texts_index = None
+    else:
+        cached_syn_texts_index = build_cached_data_index(args.cached_syn_texts_dir)
+    dataset = WebDataset(shards_list, is_train and not (args.cache_ref_model_features or args.cache_syn_texts),
+                         args.batch_size, preprocess_img, args.seed, epoch,
                          functools.partial(tokenize, tokenizer) if tokenizer is not None else None,
-                         return_index)
+                         return_index, not args.cache_ref_model_features, cached_ref_features_index,
+                         not args.cache_syn_texts, cached_syn_texts_index,
+                         num_samples_per_shard=args.num_samples_per_shard,
+                         skip_split_by_node=args.skip_webdataset_split_by_node)
     if is_train:
-        num_shards = len(expand_urls(input_shards)[0])
+        num_shards = len(shards_list)
         assert num_shards >= args.workers * args.world_size, 'number of shards must be >= total workers'
         # roll over and repeat a few samples to get same number of full batches on each node
         round_fn = math.ceil
         global_batch_size = args.batch_size * args.world_size
-        num_batches = round_fn(num_samples / global_batch_size)
+        if args.cache_ref_model_features or args.cache_syn_texts:
+            num_batches = round_fn(num_samples / args.batch_size)
+        else:
+            num_batches = round_fn(num_samples / global_batch_size)
         num_workers = max(1, args.workers)
         num_worker_batches = round_fn(num_batches / num_workers)  # per dataloader worker
         num_batches = num_worker_batches * num_workers
-        num_samples = num_batches * global_batch_size
+        if args.cache_ref_model_features or args.cache_syn_texts:
+            num_samples = num_batches * args.batch_size
+        else:
+            num_samples = num_batches * global_batch_size
         dataset = dataset.with_epoch(num_worker_batches)  # each worker is iterating over this
     else:
         # last batches are partial, eval is done on single (master) node
@@ -176,12 +263,40 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, tokenizer=None):
     dataloader.num_batches = num_batches
     dataloader.num_samples = num_samples
 
-    return DataInfo(dataloader=dataloader, shared_epoch=dataset.shared_epoch)
+    data = DataInfo(dataloader=dataloader, shared_epoch=dataset.shared_epoch)
+    data.shards_id_list = shards_id_list
+    return data
 
 
-def get_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
+def get_imagenet_wds(args, preprocess_fns, split):
+    assert split == "val"
+    batch_size = 64
+    num_workers = 4
+    preprocess_train, preprocess_val = preprocess_fns
+    input_shards = args.imagenet_val
+    preprocess_fn = preprocess_val
+    shards_list = expand_urls(input_shards)[0]
+    dataset = (
+        wds.WebDataset(shards_list, nodesplitter=lambda src: src)
+        .decode(wds.autodecode.ImageHandler("pil", extensions=["webp", "png", "jpg", "jpeg"]))
+        .to_tuple(["webp", "png", "jpg", "jpeg"], "cls")
+        .map_tuple(preprocess_fn, None)
+    )
+    dataloader = torch.utils.data.DataLoader(
+        dataset.batched(batch_size),
+        batch_size=None,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+
+    return DataInfo(dataloader=dataloader)
+
+
+def get_csv_dataset(args, preprocess_fns, is_train, epoch=0, tokenizer=None):
     input_filename = args.train_data if is_train else args.val_data
     assert input_filename
+    preprocess_train, preprocess_val = preprocess_fns
+    preprocess_fn = preprocess_train if is_train else preprocess_val
     dataset = CsvDataset(
         input_filename,
         preprocess_fn,
@@ -236,7 +351,9 @@ class SyntheticDataset(Dataset):
         return image, self.preprocess_txt(self.caption)
 
 
-def get_synthetic_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
+def get_synthetic_dataset(args, preprocess_fns, is_train, epoch=0, tokenizer=None):
+    preprocess_train, preprocess_val = preprocess_fns
+    preprocess_fn = preprocess_train if is_train else preprocess_val
     image_size = preprocess_fn.transforms[0].size
     dataset = SyntheticDataset(
         transform=preprocess_fn, image_size=image_size, dataset_size=args.train_num_samples, tokenizer=tokenizer)
@@ -280,19 +397,21 @@ def get_dataset_fn(data_path, dataset_type):
 
 
 def get_data(args, preprocess_fns, epoch=0, tokenizer=None):
-    preprocess_train, preprocess_val = preprocess_fns
     data = {}
 
     if args.train_data or args.dataset_type == "synthetic":
         data["train"] = get_dataset_fn(args.train_data, args.dataset_type)(
-            args, preprocess_train, is_train=True, epoch=epoch, tokenizer=tokenizer)
+            args, preprocess_fns, is_train=True, epoch=epoch, tokenizer=tokenizer)
 
     if args.val_data:
         data["val"] = get_dataset_fn(args.val_data, args.dataset_type)(
-            args, preprocess_val, is_train=False, tokenizer=tokenizer)
+            args, preprocess_fns, is_train=False, tokenizer=tokenizer)
 
     if args.imagenet_val is not None:
-        data["imagenet-val"] = get_imagenet(args, preprocess_fns, "val")
+        if args.imagenet_val.endswith(".tar"):
+            data["imagenet-val"] = get_imagenet_wds(args, preprocess_fns, "val")
+        else:
+            data["imagenet-val"] = get_imagenet(args, preprocess_fns, "val")
 
     if args.imagenet_v2 is not None:
         data["imagenet-v2"] = get_imagenet(args, preprocess_fns, "v2")

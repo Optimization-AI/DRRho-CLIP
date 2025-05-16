@@ -1,13 +1,15 @@
 import warnings
+import random
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torchvision.transforms.functional as F
+from PIL import ImageFilter
 
 from torchvision.transforms import Normalize, Compose, RandomResizedCrop, InterpolationMode, ToTensor, Resize, \
-    CenterCrop
+    CenterCrop, RandAugment, RandomApply, ColorJitter, RandomGrayscale, RandomHorizontalFlip
 
 from .constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
 
@@ -21,6 +23,85 @@ class AugmentationCfg:
     re_prob: Optional[float] = None
     re_count: Optional[int] = None
     use_timm: bool = False
+
+
+class ResizeKeepRatio:
+    """ Resize and Keep Ratio
+
+    Copy & paste from `timm`
+    """
+
+    def __init__(
+            self,
+            size,
+            longest=0.,
+            interpolation=InterpolationMode.BICUBIC,
+            random_scale_prob=0.,
+            random_scale_range=(0.85, 1.05),
+            random_aspect_prob=0.,
+            random_aspect_range=(0.9, 1.11)
+    ):
+        if isinstance(size, (list, tuple)):
+            self.size = tuple(size)
+        else:
+            self.size = (size, size)
+        self.interpolation = interpolation
+        self.longest = float(longest)  # [0, 1] where 0 == shortest edge, 1 == longest
+        self.random_scale_prob = random_scale_prob
+        self.random_scale_range = random_scale_range
+        self.random_aspect_prob = random_aspect_prob
+        self.random_aspect_range = random_aspect_range
+
+    @staticmethod
+    def get_params(
+            img,
+            target_size,
+            longest,
+            random_scale_prob=0.,
+            random_scale_range=(0.85, 1.05),
+            random_aspect_prob=0.,
+            random_aspect_range=(0.9, 1.11)
+    ):
+        """Get parameters
+        """
+        source_size = img.size[::-1]  # h, w
+        h, w = source_size
+        target_h, target_w = target_size
+        ratio_h = h / target_h
+        ratio_w = w / target_w
+        ratio = max(ratio_h, ratio_w) * longest + min(ratio_h, ratio_w) * (1. - longest)
+        if random_scale_prob > 0 and random.random() < random_scale_prob:
+            ratio_factor = random.uniform(random_scale_range[0], random_scale_range[1])
+            ratio_factor = (ratio_factor, ratio_factor)
+        else:
+            ratio_factor = (1., 1.)
+        if random_aspect_prob > 0 and random.random() < random_aspect_prob:
+            aspect_factor = random.uniform(random_aspect_range[0], random_aspect_range[1])
+            ratio_factor = (ratio_factor[0] / aspect_factor, ratio_factor[1] * aspect_factor)
+        size = [round(x * f / ratio) for x, f in zip(source_size, ratio_factor)]
+        return size
+
+    def __call__(self, img):
+        """
+        Args:
+            img (PIL Image): Image to be cropped and resized.
+
+        Returns:
+            PIL Image: Resized, padded to at least target size, possibly cropped to exactly target size
+        """
+        size = self.get_params(
+            img, self.size, self.longest,
+            self.random_scale_prob, self.random_scale_range,
+            self.random_aspect_prob, self.random_aspect_range
+        )
+        img = F.resize(img, size, self.interpolation)
+        return img
+
+    def __repr__(self):
+        format_string = self.__class__.__name__ + '(size={0}'.format(self.size)
+        format_string += f', interpolation={self.interpolation})'
+        format_string += f', longest={self.longest:.3f})'
+        return format_string
 
 
 class ResizeMaxSize(nn.Module):
@@ -54,14 +135,30 @@ def _convert_to_rgb(image):
     return image.convert('RGB')
 
 
+# https://github.com/facebookresearch/SLIP/blob/main/utils.py
+class GaussianBlur(object):
+    """Gaussian blur augmentation in SimCLR https://arxiv.org/abs/2002.05709"""
+
+    def __init__(self, sigma=[.1, 2.]):
+        self.sigma = sigma
+
+    def __call__(self, x):
+        sigma = random.uniform(self.sigma[0], self.sigma[1])
+        x = x.filter(ImageFilter.GaussianBlur(radius=sigma))
+        return x
+
+
 def image_transform(
         image_size: int,
         is_train: bool,
         mean: Optional[Tuple[float, ...]] = None,
         std: Optional[Tuple[float, ...]] = None,
-        resize_longest_max: bool = False,
+        resize_mode: Optional[str] = None,
+        interpolation: Optional[str] = None,
         fill_color: int = 0,
         aug_cfg: Optional[Union[Dict[str, Any], AugmentationCfg]] = None,
+        rand_augment: bool = False,
+        **kwargs,
 ):
     mean = mean or OPENAI_DATASET_MEAN
     if not isinstance(mean, (list, tuple)):
@@ -74,6 +171,14 @@ def image_transform(
     if isinstance(image_size, (list, tuple)) and image_size[0] == image_size[1]:
         # for square size, pass size as int so that Resize() uses aspect preserving shortest edge
         image_size = image_size[0]
+
+    interpolation = interpolation or 'bicubic'
+    assert interpolation in ['bicubic', 'bilinear', 'random']
+    # NOTE random is ignored for interpolation_mode, so defaults to BICUBIC for inference if set
+    interpolation_mode = InterpolationMode.BILINEAR if interpolation == 'bilinear' else InterpolationMode.BICUBIC
+
+    resize_mode = resize_mode or 'shortest'
+    assert resize_mode in ('shortest', 'squash')
 
     if isinstance(aug_cfg, dict):
         aug_cfg = AugmentationCfg(**aug_cfg)
@@ -100,10 +205,14 @@ def image_transform(
                 mean=mean,
                 std=std,
                 re_mode='pixel',
+                interpolation=interpolation,
                 **aug_cfg_dict,
             )
         else:
-            train_transform = Compose([
+            transform_list = []
+            if rand_augment:
+                transform_list.append(RandAugment())
+            transform_list.extend([
                 RandomResizedCrop(
                     image_size,
                     scale=aug_cfg_dict.pop('scale'),
@@ -113,17 +222,23 @@ def image_transform(
                 ToTensor(),
                 normalize,
             ])
+            train_transform = Compose(transform_list)
             if aug_cfg_dict:
                 warnings.warn(f'Unused augmentation cfg items, specify `use_timm` to use ({list(aug_cfg_dict.keys())}).')
         return train_transform
     else:
-        if resize_longest_max:
+        if resize_mode == 'squash':
+            if isinstance(image_size, int):
+                image_size = (image_size, image_size)
             transforms = [
-                ResizeMaxSize(image_size, fill=fill_color)
+                Resize(image_size, interpolation=interpolation_mode),
             ]
         else:
+            assert resize_mode == 'shortest'
+            if not isinstance(image_size, (tuple, list)):
+                image_size = (image_size, image_size)
             transforms = [
-                Resize(image_size, interpolation=InterpolationMode.BICUBIC),
+                Resize(image_size[0], interpolation=interpolation_mode),
                 CenterCrop(image_size),
             ]
         transforms.extend([

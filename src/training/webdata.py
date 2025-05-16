@@ -1,8 +1,12 @@
 import logging
 import random
+import functools
 from multiprocessing import Value
 from typing import Dict, Callable, Optional
+from itertools import islice
+import os
 
+import torch
 from torch.utils.data import get_worker_info
 import webdataset as wds
 from webdataset.filters import _shuffle
@@ -32,7 +36,42 @@ def log_and_continue(exn):
     return True
 
 
-def group_by_keys_nothrow(data, keys=base_plus_ext, lcase=True, suffixes=None, handler=None):
+@functools.lru_cache(maxsize=16)
+def torch_load_lru(path: str):
+    data = torch.load(path, map_location="cpu")
+    return data
+
+
+@torch.no_grad()
+def get_cached_data(index: int | torch.Tensor, cached_data_index: list[str], num_entried_per_shard: int = 10000):
+    tar_index = index // num_entried_per_shard
+    offset = index % num_entried_per_shard
+    data = None
+    if isinstance(index, int):
+        tar_path = cached_data_index[tar_index]
+        data = torch_load_lru(tar_path)[offset]
+    else:
+        for i in tar_index.unique().tolist():
+            tar_path = cached_data_index[tar_index]
+            cached_features = torch_load_lru(tar_path)
+            if data is None:
+                data = torch.zeros(index.shape[0], cached_features.shape[-2], cached_features.shape[-1])
+            data[tar_index == i] = cached_features[offset[tar_index == i]]       # shape: (batch, ...)
+        if data is not None:
+            data = data.movedim(1, 0)
+    return data
+
+
+def group_by_keys_nothrow(
+        data,
+        keys=base_plus_ext,
+        lcase=True,
+        suffixes=None,
+        handler=None,
+        cached_features_index: list[str] | None = None,
+        cached_syn_texts_index: list[str] | None = None,
+        num_samples_per_shard: int = 10000,
+        ):
     """Return function over iterator that groups key, value pairs into samples.
 
     :param keys: function that splits the key into key and extension (base_plus_ext)
@@ -52,19 +91,52 @@ def group_by_keys_nothrow(data, keys=base_plus_ext, lcase=True, suffixes=None, h
         #  begins, rare, but can happen since prefix aren't unique across tar files in that dataset
         if current_sample is None or prefix != current_sample["__key__"] or suffix in current_sample:
             if valid_sample(current_sample):
+                if cached_features_index is not None:
+                    index = int(current_sample["__key__"])
+                    features = get_cached_data(index, cached_features_index, num_samples_per_shard)
+                    current_sample["features"] = features
+                else:
+                    current_sample["features"] = None
+                if cached_syn_texts_index is not None:
+                    index = int(current_sample["__key__"])
+                    syn_texts = get_cached_data(index, cached_syn_texts_index, num_samples_per_shard)
+                    current_sample["syn_texts"] = syn_texts
+                else:
+                    current_sample["syn_texts"] = None
                 yield current_sample
             current_sample = dict(__key__=prefix, __url__=filesample["__url__"])
         if suffixes is None or suffix in suffixes:
             current_sample[suffix] = value
     if valid_sample(current_sample):
+        if cached_features_index is not None:
+            index = int(current_sample["__key__"])
+            features = get_cached_data(index, cached_features_index, num_samples_per_shard)
+            current_sample["features"] = features
+        else:
+            current_sample["features"] = None
+        if cached_syn_texts_index is not None:
+            index = int(current_sample["__key__"])
+            syn_texts = get_cached_data(index, cached_syn_texts_index, num_samples_per_shard)
+            current_sample["syn_texts"] = syn_texts
+        else:
+            current_sample["syn_texts"] = None
         yield current_sample
 
 
-def tarfile_to_samples_nothrow(src, handler=log_and_continue):
+def tarfile_to_samples_nothrow(
+        src,
+        handler=log_and_continue,
+        cached_features_index: list[str] | None = None,
+        cached_syn_texts_index: list[str] | None = None,
+        num_samples_per_shard: int = 10000,
+        ):
     # NOTE this is a re-impl of the webdataset impl with group_by_keys that doesn't throw
     streams = url_opener(src, handler=handler)
     files = tar_file_expander(streams, handler=handler)
-    samples = group_by_keys_nothrow(files, handler=handler)
+    samples = group_by_keys_nothrow(files, handler=handler,
+                                    cached_features_index=cached_features_index,
+                                    cached_syn_texts_index=cached_syn_texts_index,
+                                    num_samples_per_shard=num_samples_per_shard)
     return samples
 
 
@@ -124,6 +196,29 @@ def json_parse_key(json_dict: Dict) -> int:
     return int(json_dict["key"])
 
 
+def identity(x):
+    return x
+
+
+def pytorch_local_worker_info():
+    local_rank = 0
+    local_world_size = 1
+    if "LOCAL_RANK" in os.environ and "LOCAL_WORLD_SIZE" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+    return local_rank, local_world_size
+
+
+def split_by_local_rank(src):
+    local_rank, local_world_size = pytorch_local_worker_info()
+    if local_world_size > 1:
+        for s in islice(src, local_rank, None, local_world_size):
+            yield s
+    else:
+        for s in src:
+            yield s
+
+
 class WebDataset(wds.DataPipeline):
     r"""
         An image-text dataset that is stored in webdataset format. For more information on webdataset format,
@@ -143,12 +238,25 @@ class WebDataset(wds.DataPipeline):
                  input_shards: str,
                  is_train: bool,
                  batch_size: int,
-                 preprocess_img: Callable,
+                 preprocess_img: Callable | list[Callable],
                  seed: int = 0,
                  epoch: int = 0,
                  tokenize: Optional[Callable] = None,
                  return_index: bool = False,
+                 load_cached_features: bool = False,
+                 cached_features_index: list[str] | None = None,
+                 load_cached_syn_texts: bool = False,
+                 cached_syn_texts_index: list[str] | None = None,
+                 num_samples_per_shard: int = 10000,
+                 skip_split_by_node: bool = False,
                 ):
+        if cached_features_index is None:
+            load_cached_features = False
+        if cached_syn_texts_index is None:
+            load_cached_syn_texts = False
+        if not isinstance(preprocess_img, list):
+            preprocess_img = [preprocess_img]
+
         self.shared_epoch = SharedEpoch(epoch=epoch)  # create a shared epoch store to sync epoch to dataloader worker proc
         pipeline = [wds.SimpleShardList(input_shards)]
 
@@ -161,12 +269,25 @@ class WebDataset(wds.DataPipeline):
                     seed=seed,
                     epoch=self.shared_epoch,
                 ),
-                wds.split_by_node,
-                wds.split_by_worker,
             ])
+            if not skip_split_by_node:
+                pipeline.extend([wds.split_by_node])
+                logging.info("Splitting shards by node")
+            else:
+                # no split by node, but still split within node
+                pipeline.extend([split_by_local_rank])
+                logging.info("Splitting shards by local rank")
+            pipeline.extend([wds.split_by_worker])
+            if load_cached_features or load_cached_syn_texts:
+                tar_to_samples = functools.partial(tarfile_to_samples_nothrow,
+                                                   cached_features_index=cached_features_index,
+                                                   cached_syn_texts_index=cached_syn_texts_index,
+                                                   num_samples_per_shard=num_samples_per_shard)
+            else:
+                tar_to_samples = tarfile_to_samples_nothrow
             pipeline.extend([
                 # at this point, we have an iterator over the shards assigned to each worker at each node
-                tarfile_to_samples_nothrow,  # wds.tarfile_to_samples(handler=log_and_continue),
+                tar_to_samples,  # wds.tarfile_to_samples(handler=log_and_continue),
                 wds.shuffle(
                     bufsize=_SAMPLE_SHUFFLE_SIZE,
                     initial=_SAMPLE_SHUFFLE_INITIAL,
@@ -179,24 +300,38 @@ class WebDataset(wds.DataPipeline):
                 wds.tarfile_to_samples(handler=log_and_continue),
             ])
 
-        # here we also load the key of data
+        rename_dict = {"image": "jpg;png;jpeg;webp", "text": "txt"}
+        map_dict = {"image": preprocess_img[0]}
+        to_tuple_list = ["image", "text"]
+        only = ["jpg", "png", "jpeg", "webp", "txt"]
+
+        if tokenize is not None:
+            map_dict.update({"text": tokenize})
         if return_index:
-            rename = wds.rename(image="jpg;png;jpeg;webp", text="txt", key="json")
-            if tokenize is not None:
-                map_dict = wds.map_dict(image=preprocess_img, text=tokenize, key=json_parse_key)
-            else:
-                map_dict = wds.map_dict(image=preprocess_img, key=json_parse_key)
-            to_tuple = wds.to_tuple("image", "text", "key", "key")
-        else:
-            rename = wds.rename(image="jpg;png;jpeg;webp", text="txt")
-            if tokenize is not None:
-                map_dict = wds.map_dict(image=preprocess_img, text=tokenize)
-            else:
-                map_dict = wds.map_dict(image=preprocess_img)
-            to_tuple = wds.to_tuple("image", "text")
+            rename_dict.update({"key": "json"})
+            map_dict.update({"key": json_parse_key})
+            to_tuple_list = to_tuple_list + ["key", "key"]
+            only.append("json")
+        if load_cached_features:
+            rename_dict.update({"features": "features"})
+            map_dict.update({"features": identity})
+            to_tuple_list.append("features")
+        if load_cached_syn_texts:
+            rename_dict.update({"syn_texts": "syn_texts"})
+            map_dict.update({"syn_texts": identity})
+            to_tuple_list.append("syn_texts")
+        if len(preprocess_img) > 1:
+            for i in range(1, len(preprocess_img)):
+                rename_dict.update({f"image_{i+1}": "jpg;png;jpeg;webp"})
+                map_dict.update({f"image_{i+1}": preprocess_img[i]})
+                to_tuple_list.append(f"image_{i+1}")
+
+        rename = wds.rename(**rename_dict)
+        map_dict = wds.map_dict(**map_dict)
+        to_tuple = wds.to_tuple(*to_tuple_list)
         pipeline.extend([
             wds.select(filter_no_caption_or_no_image),
-            wds.decode("pilrgb", handler=log_and_continue),
+            wds.decode("pilrgb", handler=log_and_continue, only=only),
             rename, map_dict, to_tuple,
             wds.batched(batch_size, partial=not is_train)
         ])

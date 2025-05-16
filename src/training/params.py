@@ -1,4 +1,5 @@
 import argparse
+import jsonargparse
 import ast
 
 
@@ -24,7 +25,8 @@ class ParseKwargs(argparse.Action):
 
 
 def parse_args(args):
-    parser = argparse.ArgumentParser()
+    # parser = argparse.ArgumentParser()
+    parser = jsonargparse.ArgumentParser()
     parser.add_argument(
         "--train-data",
         type=str,
@@ -442,7 +444,7 @@ def parse_args(args):
         action="store_true",
         help='Use SigLip (sigmoid) loss.'
     )
-    
+
     parser.add_argument("--optimizer", type=str, default="adamw", help="Optimizer to use, can be ['adamw', 'lamb'].")
     parser.add_argument("--lr_tau", type=float, default=-1.0,
                         help="Learning rate of the temperature parameter. If < 0, will be set to lr of the model.")
@@ -451,23 +453,89 @@ def parse_args(args):
                         help=("Temperature scheme for FastCLIP. Combination of"
                               " ['global', 'individual'] (only works for FastCLIP) and ['learnable', 'constant']."))
     parser.add_argument("--profile", default=False, action="store_true", help="Whether to profile training stats.")
-    parser.add_argument("--lr_min", type=float, default=0.0,
-                        help=("The minimum learning rate of the model and the temperature parameter."
-                              " Only works when using the cosine scheduler."))
+    parser.add_argument("--config_file", action=jsonargparse.ActionConfigFile,
+                        help="Optional configuration file in JSON or YAML format.")
+    parser.add_argument("--world_size", type=int, default=1, help="Total number of GPUs to use.")
+    parser.add_argument("--dist_port", type=str, default="29500", help="Port for distributed training.")
     parser.add_argument("--stop_epochs", type=int, default=-1,
                         help=("The training will stop after this epoch. Useful when the training needs"
                               " to be split into several parts. If < 0, will stop after --epochs"))
+    parser.add_argument("--num_samples_per_shard", type=int, default=10000,
+                        help=("Number of samples per shard in webdataset. Used when caching and sharding"
+                              " reference model features."))
+    parser.add_argument("--momentum", type=float, default=0.9, help="Momentum for the optimizer.")
+    parser.add_argument("--iters", type=int, default=-1,
+                        help=("Total number of iterations."
+                              " If given, the learning rate schedule will be based on this value."))
+    parser.add_argument("--stop_iters", type=int, default=-1, help="Stop training after this many iterations.")
+    parser.add_argument("--logit_scale_bound", type=float, default=100.0, help="Upper bound for logit scale.")
+    parser.add_argument("--lr_min", type=float, default=0.0,
+                        help=("The minimum learning rate of the model and the temperature parameter."
+                              " Only works when using the cosine scheduler."))
 
     # fastclip
     parser.add_argument("--fastclip", default=False, action="store_true", help="Whether to use FastCLIP losses.")
     parser.add_argument("--gamma", type=float, default=0.8, help="Inner learning rate in FastCLIP.")
-    parser.add_argument("--gamma_schedule", type=str, default="cosine", help="Schedule for gamma in FastCLIP, can be ['constant', 'cosine'].")
+    parser.add_argument("--gamma_schedule", type=str, default="cosine",
+                        help="Schedule for gamma in FastCLIP, can be ['constant', 'cosine'].")
     parser.add_argument("--gamma_decay_epochs", type=int, default=10, help="Decay epochs for gamma in FastCLIP.")
     parser.add_argument("--rho", type=float, default=8.0, help="Rho in FastCLIP.")
     parser.add_argument("--fastclip_eps", type=float, default=1e-14, help="Epsilon in FastCLIP.")
-    parser.add_argument("--multiply_tau", default=False, action="store_true", help="Whether to multiply the FastCLIP loss by tau.")
+    parser.add_argument("--multiply_tau", default=False, action="store_true",
+                        help="Whether to multiply the FastCLIP loss by tau.")
     parser.add_argument("--temperature", type=float, default=0.07, help="Initial temperature value.")
     parser.add_argument("--data_size", type=int, default=-1, help="Original dataset size.")
+    parser.add_argument("--ref_model", type=str, default="", help="Reference model to compute the reference loss")
+    parser.add_argument("--ref_model_pretrained", type=str, default="",
+                        help="Pretrained checkpoint name for the reference model")
+    parser.add_argument("--ref_model_checkpoint", type=str, default="",
+                        help="Path to load the reference model. Only used if --ref_model_pretrained is not set.")
+    parser.add_argument("--cache_ref_model_features", default=False, action="store_true",
+                        help=("Whether to cache the features of the reference model."
+                              " If True, training will not be done, only the reference features will be cached."))
+    parser.add_argument("--cached_ref_features_dir", type=str, default="",
+                        help="Directory to store the cached features of the reference model.")
+    parser.add_argument("--ref_features_offset", type=int, default=0,
+                        help="Offset to cache reference model features.")
+    parser.add_argument("--ref_features_usage", type=str, default="ref",
+                        help="How to use the reference features, can be combination of ['ref', 'distill', 'select'].")
+    parser.add_argument("--ref_filter_ratio", type=float, default=0.8,
+                        help="Ratio of discarded examples in example selection.")
+    parser.add_argument("--ref_filter_n_chunks", type=int, default=2,
+                        help="Nubmer of chunks to use in example selection.")
+    parser.add_argument("--ref_filter_topk", default=False, action="store_true",
+                        help="Whether to use topk selection or sampleing in example selection.")
+    parser.add_argument("--distill_weight", type=float, default=1.0,
+                        help="Weight for the distillation loss.")
+    parser.add_argument("--distill_ref_logit_scale", type=float, default=0.0,
+                        help="Logit scale used in reference loss when ref_features_usage is 'distill_ref'")
+    parser.add_argument("--distill_logit_scale", type=float, default=100.0,
+                        help="Logit scale of the teacher in distillation loss")
+    parser.add_argument("--distill_teacher_dimension", type=int, default=[-1], nargs="+",
+                        help="Number of dimensions for each teacher. Default: [-1].")
+    parser.add_argument("--distill_average_after_softmax", default=False, action="store_true",
+                        help='For ensemble models in distillation, average logits after Softmax.')
+    parser.add_argument("--cap_model", type=str, default="", help="Captioning model to generate synthetic captions.")
+    parser.add_argument("--cap_model_pretrained", type=str, default="",
+                        help="Pretrained checkpoint name for the captioning model")
+    parser.add_argument("--rand_augment", default=False, action="store_true",
+                        help="Whether to apply RandAugment to images.")
+    parser.add_argument("--cache_syn_texts", default=False, action="store_true",
+                        help="Whether to cache the synthetic captions generated by the captioning model.")
+    parser.add_argument("--cached_syn_texts_dir", type=str, default="",
+                        help="Directory to store the cached synthetic captions generated by the captioning model.")
+    parser.add_argument("--syn_texts_offset", type=int, default=0,
+                        help="Offset to generate synthetic captions.")
+    parser.add_argument("--num_syn_texts", type=int, default=5,
+                        help="Number of generated synthetic captions for each sample.")
+    parser.add_argument("--skip_webdataset_split_by_node", default=False, action="store_true",
+                        help="Whether to skip splitting the webdataset by node.")
+    parser.add_argument("--cache_group_size", type=int, default=1,
+                        help="Group size for caching reference model features or synthetic texts.")
+    parser.add_argument("--cache_rank", type=int, default=0,
+                        help="Rank for caching reference model features or synthetic texts.")
+    parser.add_argument("--loss_weight", type=float, default=1.0,
+                        help="Weight for the contrastive loss.")
 
     args = parser.parse_args(args)
 

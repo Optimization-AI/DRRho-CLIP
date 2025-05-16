@@ -457,7 +457,7 @@ class VisionTransformer(nn.Module):
         else:
             return x[:, 0], x[:, 1:]
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, skip_patch_dropout: bool = False):
 
         # to patches - whether to use dual patchnorm - https://arxiv.org/abs/2302.01327v1
         if self.input_patchnorm:
@@ -479,7 +479,8 @@ class VisionTransformer(nn.Module):
         x = x + self.positional_embedding.to(x.dtype)
 
         # a patch_dropout of 0. would mean it is disabled and this function would do nothing but return what was passed in
-        x = self.patch_dropout(x)
+        if not skip_patch_dropout:
+            x = self.patch_dropout(x)
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND

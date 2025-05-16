@@ -8,6 +8,8 @@ import random
 from datetime import datetime
 import functools
 import socket
+from typing import Optional
+import traceback
 
 import numpy as np
 import torch
@@ -29,15 +31,15 @@ try:
 except ImportError:
     hvd = None
 
-from fast_clip import create_model_and_transforms, trace_model, get_tokenizer, create_loss
+from fast_clip import create_model_and_transforms, trace_model, get_tokenizer, create_loss, create_model, get_model_config
 from training.data import get_data
 from training.distributed import is_master, init_distributed_device, broadcast_object
 from training.logger import setup_logging
 from training.params import parse_args
 from training.scheduler import cosine_lr, const_lr, const_lr_cooldown, step_lr_thresh
-from training.train import train_one_epoch, evaluate
+from training.train import train_one_epoch, evaluate, cache_features, shard_features, cache_syn_texts
 from training.file_utils import pt_load, check_exists, start_sync_process, remote_sync
-from training.optimizer import LAMB
+from training.optimizer import LAMB, Lion
 
 
 LATEST_CHECKPOINT_NAME = "epoch_latest.pt"
@@ -68,6 +70,101 @@ def get_latest_checkpoint(path: str, remote : bool):
         checkpoints = sorted(checkpoints, key=natural_key)
         return checkpoints[-1]
     return None
+
+
+def create_optimizer(
+        optimizer_name: str,
+        model: torch.nn.Module,
+        lr: float,
+        lr_tau: float,
+        wd: float,
+        beta1: Optional[float] = None,
+        beta2: Optional[float] = None,
+        eps: Optional[float] = None,
+        momentum: Optional[float] = None,
+) -> torch.optim.Optimizer:
+    is_logit_scale = lambda n, p: "logit_scale" in n
+    exclude = lambda n, p: (p.ndim < 2 and "logit_scale" not in n) or "bn" in n or "ln" in n or "bias" in n
+    include = lambda n, p: not exclude(n, p) and not is_logit_scale(n, p)
+
+    if lr_tau < 0.0:
+        lr_tau = lr
+
+    logging.info(f"optimizer: {optimizer_name}, lr: {lr}, lr_tau: {lr_tau}")
+
+    named_parameters = list(model.named_parameters())
+    gain_or_bias_params = []
+    gain_or_bias_params_names = []
+    rest_params = []
+    rest_params_names = []
+    logit_scale_params = []
+    logit_scale_params_names = []
+    for n, p in named_parameters:
+        if exclude(n, p) and p.requires_grad:
+            gain_or_bias_params.append(p)
+            gain_or_bias_params_names.append(n)
+        elif include(n, p) and p.requires_grad:
+            rest_params.append(p)
+            rest_params_names.append(n)
+        elif is_logit_scale(n, p) and p.requires_grad:
+            logit_scale_params.append(p)
+            logit_scale_params_names.append(n)
+
+    if optimizer_name == "adamw":
+        assert beta1 is not None and beta2 is not None and eps is not None
+        optimizer = optim.AdamW(
+            [
+                {"params": gain_or_bias_params, "weight_decay": 0.},
+                {"params": rest_params, "weight_decay": wd},
+                {"params": logit_scale_params, "weight_decay": 0., "lr": lr_tau},
+            ],
+            lr=lr,
+            betas=(beta1, beta2),
+            eps=eps,
+        )
+    elif optimizer_name == "lamb":
+        assert beta1 is not None and beta2 is not None and eps is not None
+        optimizer = LAMB(
+            [
+                {"params": gain_or_bias_params, "weight_decay": 0.},
+                {"params": rest_params, "weight_decay": wd},
+                {"params": logit_scale_params, "weight_decay": 0., "lr": lr_tau},
+            ],
+            lr=lr,
+            betas=(beta1, beta2),
+            eps=eps,
+        )
+    elif optimizer_name == "lion":
+        assert beta1 is not None and beta2 is not None
+        optimizer = Lion(
+            [
+                {"params": gain_or_bias_params, "weight_decay": 0.},
+                {"params": rest_params, "weight_decay": wd},
+                {"params": logit_scale_params, "weight_decay": 0., "lr": lr_tau},
+            ],
+            lr=lr,
+            betas=(beta1, beta2),
+        )
+    elif optimizer_name == "nesterov" or optimizer_name == "sgd":
+        assert momentum is not None
+        if optimizer_name == "nesterov":
+            nesterov = True
+        else:
+            nesterov = False
+        optimizer = optim.SGD(
+            [
+                {"params": gain_or_bias_params, "weight_decay": 0.},
+                {"params": rest_params, "weight_decay": wd},
+                # NOTE we set momentum to 0 for logit scale
+                {"params": logit_scale_params, "weight_decay": 0., "lr": lr_tau, "momentum": 0.},
+            ],
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+        )
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_name}")
+    return optimizer
 
 
 def main(args):
@@ -108,23 +205,38 @@ def main(args):
         os.makedirs(log_base_path, exist_ok=True)
         log_filename = f'out-{args.rank}' if args.log_local else 'out.log'
         args.log_path = os.path.join(log_base_path, log_filename)
-        if os.path.exists(args.log_path) and not resume_latest and args.resume is None:
-            print(
-                "Error. Experiment already exists. Use --name {} to specify a new experiment."
-            )
-            return -1
 
     # Setup text logger
     args.log_level = logging.DEBUG if args.debug else logging.INFO
     setup_logging(args.log_path, args.log_level)
 
+    is_done = os.path.exists(os.path.join(log_base_path, 'job.done'))
+    if is_done and not resume_latest and args.resume is None:
+        logging.error(
+            "Error. Experiment already exists. Use --name {} to specify a new experiment."
+        )
+        return
+
     # Setup wandb, tensorboard, checkpoint logging
     args.wandb = 'wandb' in args.report_to or 'all' in args.report_to
     args.tensorboard = 'tensorboard' in args.report_to or 'all' in args.report_to
     args.checkpoint_path = os.path.join(log_base_path, "checkpoints")
+    if args.cache_ref_model_features:
+        args.ref_features_path = os.path.join(log_base_path, f"reference_features")
+    else:
+        args.ref_features_path = ""
+    if args.cache_syn_texts:
+        args.syn_texts_path = os.path.join(log_base_path, f"synthetic_texts")
+    else:
+        args.syn_texts_path = ""
+    if args.debug:
+        args.debug_path = os.path.join(log_base_path, f"debug_stats")
+    else:
+        args.debug_path = ""
     if is_master(args):
         args.tensorboard_path = os.path.join(log_base_path, "tensorboard") if args.tensorboard else ''
-        for dirname in [args.tensorboard_path, args.checkpoint_path]:
+        for dirname in [args.tensorboard_path, args.checkpoint_path, args.ref_features_path,\
+                        args.syn_texts_path, args.debug_path]:
             if dirname:
                 os.makedirs(dirname, exist_ok=True)
     else:
@@ -172,8 +284,8 @@ def main(args):
     if is_master(args) and args.remote_sync is not None:
         # first make sure it works
         result = remote_sync(
-            os.path.join(args.logs, args.name), 
-            os.path.join(args.remote_sync, args.name), 
+            os.path.join(args.logs, args.name),
+            os.path.join(args.remote_sync, args.name),
             args.remote_sync_protocol
         )
         if result:
@@ -184,8 +296,8 @@ def main(args):
         # if all looks good, start a process to do this every args.remote_sync_frequency seconds
         remote_sync_process = start_sync_process(
             args.remote_sync_frequency,
-            os.path.join(args.logs, args.name), 
-            os.path.join(args.remote_sync, args.name), 
+            os.path.join(args.logs, args.name),
+            os.path.join(args.remote_sync, args.name),
             args.remote_sync_protocol
         )
         remote_sync_process.start()
@@ -239,12 +351,13 @@ def main(args):
         image_std=args.image_std,
         aug_cfg=args.aug_cfg,
         output_dict=True,
+        rand_augment=args.rand_augment,
         **model_kwargs,
     )
     if args.distill:
         # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
         dist_model, _, _ = create_model_and_transforms(
-            args.distill_model, 
+            args.distill_model,
             args.distill_pretrained,
             device=device,
             precision=args.precision,
@@ -261,6 +374,56 @@ def main(args):
         linear_replacement_cls = getattr(bnb.nn.triton_based_modules, args.use_bnb_linear)
         replace_linear(model, linear_replacement_cls)
         model = model.to(device)
+    if args.ref_model:
+        logging.info("Creating reference model.")
+        ref_model, ref_preprocess_train, ref_preprocess_val = create_model_and_transforms(
+            args.ref_model,
+            args.ref_model_pretrained,
+            precision=args.precision,
+            device=device,
+            jit=args.torchscript,
+            force_quick_gelu=args.force_quick_gelu,
+            force_custom_text=args.force_custom_text,
+            force_patch_dropout=args.force_patch_dropout,
+            force_image_size=args.force_image_size,
+            pretrained_image=args.pretrained_image,
+            image_mean=args.image_mean,
+            image_std=args.image_std,
+            aug_cfg=args.aug_cfg,
+            output_dict=True,
+            **model_kwargs,
+        )
+        if not args.ref_model_pretrained and args.ref_model_checkpoint:
+            logging.info(f"Loading reference model checkpoint from {args.ref_model_checkpoint}")
+            ref_model_checkpoint = pt_load(args.ref_model_checkpoint, map_location='cpu')
+            sd = ref_model_checkpoint["state_dict"]
+            if next(iter(sd.items()))[0].startswith('module'):
+                sd = {k[len('module.'):]: v for k, v in sd.items()}
+            ref_model.load_state_dict(sd)
+    else:
+        ref_model = None
+    if args.ref_model and args.cache_ref_model_features:
+        preprocess_train, preprocess_val = ref_preprocess_train, ref_preprocess_val
+    if args.cap_model:
+        logging.info("Creating captioning model.")
+        cap_model, _, _ = create_model_and_transforms(
+            args.cap_model,
+            args.cap_model_pretrained,
+            precision=args.precision,
+            device=device,
+            jit=args.torchscript,
+            force_quick_gelu=args.force_quick_gelu,
+            force_custom_text=args.force_custom_text,
+            force_patch_dropout=args.force_patch_dropout,
+            force_image_size=args.force_image_size,
+            pretrained_image=args.pretrained_image,
+            image_mean=args.image_mean,
+            image_std=args.image_std,
+            aug_cfg=args.aug_cfg,
+            output_dict=True,
+        )
+    else:
+        cap_model = None
 
     if "constant" in args.temperature_scheme or "individual" in args.temperature_scheme:
         model.logit_scale.requires_grad = False
@@ -283,17 +446,6 @@ def main(args):
     if args.grad_checkpointing:
         model.set_grad_checkpointing()
 
-    if is_master(args):
-        logging.info("Model:")
-        logging.info(f"{str(model)}")
-        logging.info("Params:")
-        params_file = os.path.join(args.logs, args.name, "params.txt")
-        with open(params_file, "w") as f:
-            for name in sorted(vars(args)):
-                val = getattr(args, name)
-                logging.info(f"  {name}: {val}")
-                f.write(f"{name}: {val}\n")
-
     if args.distributed and not args.horovod:
         if args.use_bn_sync:
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -302,7 +454,7 @@ def main(args):
             # this doesn't exist in older PyTorch, arg only added if enabled
             ddp_args['static_graph'] = True
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], **ddp_args)
-    
+
         if args.distill:
             dist_model = torch.nn.parallel.DistributedDataParallel(dist_model, device_ids=[device], **ddp_args)
 
@@ -312,58 +464,17 @@ def main(args):
 
     if args.train_data or args.dataset_type == "synthetic":
         assert not args.trace, 'Cannot train with traced model'
-
-        is_logit_scale = lambda n, p: "logit_scale" in n
-        exclude = lambda n, p: (p.ndim < 2 and "logit_scale" not in n) or "bn" in n or "ln" in n or "bias" in n
-        include = lambda n, p: not exclude(n, p) and not is_logit_scale(n, p)
-
-        if args.lr_tau < 0.0:
-            args.lr_tau = args.lr
-
-        logging.info(f"optimizer: {args.optimizer}, lr: {args.lr}, lr_tau: {args.lr_tau}")
-
-        named_parameters = list(model.named_parameters())
-        gain_or_bias_params = []
-        gain_or_bias_params_names = []
-        rest_params = []
-        rest_params_names = []
-        logit_scale_params = []
-        logit_scale_params_names = []
-        for n, p in named_parameters:
-            if exclude(n, p) and p.requires_grad:
-                gain_or_bias_params.append(p)
-                gain_or_bias_params_names.append(n)
-            elif include(n, p) and p.requires_grad:
-                rest_params.append(p)
-                rest_params_names.append(n)
-            elif is_logit_scale(n, p) and p.requires_grad:
-                logit_scale_params.append(p)
-                logit_scale_params_names.append(n)
-
-        if args.optimizer == "adamw":
-            optimizer = optim.AdamW(
-                [
-                    {"params": gain_or_bias_params, "weight_decay": 0.},
-                    {"params": rest_params, "weight_decay": args.wd},
-                    {"params": logit_scale_params, "weight_decay": 0., "lr": args.lr_tau},
-                ],
-                lr=args.lr,
-                betas=(args.beta1, args.beta2),
-                eps=args.eps,
-            )
-        elif args.optimizer == "lamb":
-            optimizer = LAMB(
-                [
-                    {"params": gain_or_bias_params, "weight_decay": 0.},
-                    {"params": rest_params, "weight_decay": args.wd},
-                    {"params": logit_scale_params, "weight_decay": 0., "lr": args.lr_tau},
-                ],
-                lr=args.lr,
-                betas=(args.beta1, args.beta2),
-                eps=args.eps,
-            )
-        else:
-            raise ValueError(f"Unknown optimizer: {args.optimizer}")
+        optimizer = create_optimizer(
+            args.optimizer,
+            model,
+            args.lr,
+            args.lr_tau,
+            args.wd,
+            args.beta1,
+            args.beta2,
+            args.eps,
+            args.momentum,
+        )
         if args.horovod:
             optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters())
             hvd.broadcast_parameters(model.state_dict(), root_rank=0)
@@ -410,11 +521,67 @@ def main(args):
     data = get_data(args, (preprocess_train, preprocess_val), epoch=start_epoch, tokenizer=get_tokenizer(args.model))
     assert len(data), 'At least one train or eval dataset must be specified.'
 
+    if "select" in args.ref_features_usage:
+        args.train_batch_size = int(args.batch_size * (100 - args.ref_filter_ratio * 100) / 100)
+    else:
+        args.train_batch_size = args.batch_size
+
+    if 'train' in data:
+        num_batches = data["train"].dataloader.num_batches
+        if args.stop_iters > 0:
+            training_steps = args.stop_iters
+        elif args.stop_epochs > 0:
+            training_steps = num_batches * args.stop_epochs
+        elif args.iters > 0:
+            training_steps = args.iters
+        else:
+            training_steps = num_batches * args.epochs
+        args.training_steps = training_steps
+    else:
+        args.training_steps = 0
+
+    # load or cache reference model features
+    if args.ref_model and args.cache_ref_model_features:
+        if os.path.exists(os.path.join(args.ref_features_path, f"{args.ref_model}_features.pt")):
+            logging.info("Loading reference model features.")
+            ref_features_dict = torch.load(os.path.join(args.ref_features_path, f"{args.ref_model}_features.pt"),
+                                           map_location='cpu')
+            ref_features_all = ref_features_dict["features"]
+            is_ref_features_cached = ref_features_dict["is_cached"]
+        else:
+            model_cfg = get_model_config(args.ref_model)
+            embed_dim = model_cfg["embed_dim"]
+            ref_features_all = torch.zeros((args.data_size, 2, embed_dim))
+            is_ref_features_cached = torch.zeros(args.data_size, dtype=torch.bool)
+    else:
+        ref_features_all = None
+        is_ref_features_cached = None
+    ref_features_dict = {"features": ref_features_all, "is_cached": is_ref_features_cached}
+
+    # load or cache synthetic texts
+    if args.cap_model and args.cache_syn_texts:
+        if os.path.exists(os.path.join(args.syn_texts_path, f"{args.cap_model}_syn_texts.pt")):
+            logging.info("Loading generated synthetic captions.")
+            syn_texts_dict = torch.load(os.path.join(args.syn_texts_path, f"{args.cap_model}_syn_texts.pt"),
+                                           map_location='cpu')
+            syn_texts_all = syn_texts_dict["syn_texts"]
+            is_ref_features_cached = syn_texts_dict["is_cached"]
+        else:
+            syn_texts_all = torch.zeros((args.data_size, args.num_syn_texts, 77), dtype=torch.int64)
+            is_ref_features_cached = torch.zeros(args.data_size, dtype=torch.bool)
+    else:
+        syn_texts_all = None
+        is_ref_features_cached = None
+    syn_texts_dict = {"syn_texts": syn_texts_all, "is_cached": is_ref_features_cached}
+
     # create scheduler if train
     scheduler = None
     if 'train' in data and optimizer is not None:
         num_batches = data["train"].dataloader.num_batches
-        total_steps = (num_batches // args.accum_freq) * args.epochs
+        if args.iters <= 0:
+            total_steps = num_batches * args.epochs
+        else:
+            total_steps = args.iters
         lr_list = [args.lr, args.lr]
         lr_tau_list = [args.lr_tau]
         param_groups = optimizer.param_groups
@@ -430,7 +597,7 @@ def main(args):
             elif lr_scheduler == "const-cooldown":
                 assert args.epochs_cooldown is not None,\
                     "Please specify the number of cooldown epochs for this lr schedule."
-                cooldown_steps = (num_batches // args.accum_freq) * args.epochs_cooldown
+                cooldown_steps = num_batches * args.epochs_cooldown
                 sche = const_lr_cooldown(
                     group, lr_l, args.warmup, total_steps,
                     cooldown_steps, args.lr_cooldown_power, args.lr_cooldown_end)
@@ -515,58 +682,110 @@ def main(args):
     else:
         prof = None
 
-    for epoch in range(start_epoch, args.epochs):
-        if args.stop_epochs > 0 and epoch >= args.stop_epochs:
-            logging.info(f'Stop training at epoch {epoch}.')
-            break
-        if is_master(args):
-            logging.info(f'Start epoch {epoch}')
+    # disable logging model arch and hyperparams for evaluation jobs
+    if is_master(args) and args.train_data:
+        logging.info("Model:")
+        logging.info(f"{str(model)}")
+        logging.info("Params:")
+        params_file = os.path.join(args.logs, args.name, "params.txt")
+        with open(params_file, "w") as f:
+            for name in sorted(vars(args)):
+                val = getattr(args, name)
+                logging.info(f"  {name}: {val}")
+                f.write(f"{name}: {val}\n")
 
-        train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args,
-                        tb_writer=writer, profiler=prof)
-        completed_epoch = epoch + 1
+    if args.cache_ref_model_features:
+        del model
+        logging.info(f'Start caching reference model features.')
+        cache_features(ref_model, ref_features_dict, data, args,
+                       num_samples_per_shard=args.num_samples_per_shard)
+        logging.info(f'Finish caching reference model features.')
+        if args.cached_ref_features_dir:
+            os.makedirs(args.cached_ref_features_dir, exist_ok=True)
+            shard_features(ref_features_dict["features"], args.ref_features_offset,
+                           args.cached_ref_features_dir, num_samples_per_shard=args.num_samples_per_shard,
+                           shards_id_list=data['train'].shards_id_list)
+            torch.save(ref_features_dict["is_cached"], os.path.join(args.ref_features_path,
+                       f"{args.ref_model}_is_cached_{args.rank}.pt"))
+        else:
+            torch.save(ref_features_dict, os.path.join(args.ref_features_path,
+                       f"{args.ref_model}_features_{args.rank}.pt"))
+    elif args.cache_syn_texts:
+        del model
+        logging.info(f'Start caching generated synthetic captions.')
+        cache_syn_texts(cap_model, syn_texts_dict, data, args)
+        logging.info(f'Finish caching generated synthetic captions.')
+        if args.cached_syn_texts_dir:
+            os.makedirs(args.cached_syn_texts_dir, exist_ok=True)
+            shard_features(syn_texts_dict["syn_texts"], args.syn_texts_offset,
+                           args.cached_syn_texts_dir, num_samples_per_shard=args.num_samples_per_shard)
+            torch.save(syn_texts_dict["is_cached"], os.path.join(args.syn_texts_path, f"{args.cap_model}_is_cached_{args.rank}.pt"))
+        else:
+            torch.save(syn_texts_dict, os.path.join(args.syn_texts_path, f"{args.cap_model}_syn_texts_{args.rank}.pt"))
+    else:
+        for epoch in range(start_epoch, args.epochs):
+            if args.stop_epochs > 0 and epoch >= args.stop_epochs:
+                logging.info(f'Stopping training at epoch {epoch}.')
+                break
+            if args.stop_iters > 0 and epoch * data['train'].dataloader.num_batches >= args.stop_iters:
+                logging.info(f'Stopping training at iteration {args.stop_iters}.')
+                break
+            if is_master(args):
+                logging.info(f'Start epoch {epoch}')
 
-        if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
-            evaluate(model, data, completed_epoch, args, writer)
+            train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args,
+                            tb_writer=writer, profiler=prof, ref_model=ref_model, cap_model=cap_model)
+            completed_epoch = epoch + 1
 
-        # Saving checkpoints.
-        if args.save_logs:
-            checkpoint_dict = {
-                "epoch": completed_epoch,
-                "name": args.name,
-                "state_dict": original_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-            }
-            if scaler is not None:
-                checkpoint_dict["scaler"] = scaler.state_dict()
-            if args.fastclip:
-                checkpoint_dict["u_im"] = loss.u_im
-                checkpoint_dict["u_tt"] = loss.u_tt
-                if "individual" in args.temperature_scheme:
-                    tau_dict = {"tau_im": loss.tau_im, "tau_tt": loss.tau_tt,
-                                "m_grad_tau_im": loss.m_grad_tau_im, "m_grad_tau_tt": loss.m_grad_tau_tt,
-                                "v_grad_tau_im": loss.v_grad_tau_im, "v_grad_tau_tt": loss.v_grad_tau_tt,
-                                "bound_im": loss.bound_im, "bound_tt": loss.bound_tt}
-                    checkpoint_dict.update(tau_dict)
+            if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
+                try:
+                    evaluate(model, data, completed_epoch, args, writer)
+                except:
+                    traceback.print_exc()
 
-            if completed_epoch == args.epochs or (
-                args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
-            ):
-                torch.save(
-                    checkpoint_dict,
-                    os.path.join(args.checkpoint_path, f"epoch_{completed_epoch}.pt"),
-                )
-            if args.delete_previous_checkpoint:
-                previous_checkpoint = os.path.join(args.checkpoint_path, f"epoch_{completed_epoch - 1}.pt")
-                if os.path.exists(previous_checkpoint):
-                    os.remove(previous_checkpoint)
+            # Saving checkpoints.
+            if args.save_logs:
+                checkpoint_dict = {
+                    "epoch": completed_epoch,
+                    "name": args.name,
+                    "optimizer": optimizer.state_dict(),
+                }
+                state_dict = original_model.state_dict()
+                checkpoint_dict["state_dict"] = state_dict
+                if scaler is not None:
+                    checkpoint_dict["scaler"] = scaler.state_dict()
+                if args.fastclip:
+                    checkpoint_dict["u_im"] = loss.u_im
+                    checkpoint_dict["u_tt"] = loss.u_tt
+                    if "individual" in args.temperature_scheme:
+                        tau_dict = {"tau_im": loss.tau_im, "tau_tt": loss.tau_tt,
+                                    "m_grad_tau_im": loss.m_grad_tau_im, "m_grad_tau_tt": loss.m_grad_tau_tt,
+                                    "v_grad_tau_im": loss.v_grad_tau_im, "v_grad_tau_tt": loss.v_grad_tau_tt,
+                                    "bound_im": loss.bound_im, "bound_tt": loss.bound_tt}
+                        checkpoint_dict.update(tau_dict)
 
-            if args.save_most_recent:
-                # try not to corrupt the latest checkpoint if save fails
-                tmp_save_path = os.path.join(args.checkpoint_path, "tmp.pt")
-                latest_save_path = os.path.join(args.checkpoint_path, LATEST_CHECKPOINT_NAME)
-                torch.save(checkpoint_dict, tmp_save_path)
-                os.replace(tmp_save_path, latest_save_path)
+                if completed_epoch == args.epochs or (
+                    args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
+                ):
+                    torch.save(
+                        checkpoint_dict,
+                        os.path.join(args.checkpoint_path, f"epoch_{completed_epoch}.pt"),
+                    )
+                if args.delete_previous_checkpoint:
+                    previous_checkpoint = os.path.join(args.checkpoint_path, f"epoch_{completed_epoch - 1}.pt")
+                    if os.path.exists(previous_checkpoint):
+                        os.remove(previous_checkpoint)
+
+                if args.save_most_recent:
+                    # try not to corrupt the latest checkpoint if save fails
+                    tmp_save_path = os.path.join(args.checkpoint_path, "tmp.pt")
+                    latest_save_path = os.path.join(args.checkpoint_path, LATEST_CHECKPOINT_NAME)
+                    torch.save(checkpoint_dict, tmp_save_path)
+                    os.replace(tmp_save_path, latest_save_path)
+
+    if is_master(args):
+        with open(os.path.join(log_base_path, 'job.done'), 'a') as f:
+            f.write(f"Job finished at {datetime.now()}\n")
 
     if args.wandb and is_master(args):
         wandb.finish()
@@ -576,15 +795,15 @@ def main(args):
         logging.info('Final remote sync.')
         remote_sync_process.terminate()
         result = remote_sync(
-            os.path.join(args.logs, args.name), 
-            os.path.join(args.remote_sync, args.name), 
+            os.path.join(args.logs, args.name),
+            os.path.join(args.remote_sync, args.name),
             args.remote_sync_protocol
         )
         if result:
             logging.info('Final remote sync successful.')
         else:
             logging.info('Final remote sync failed.')
-    
+
 
 def copy_codebase(args):
     from shutil import copytree, ignore_patterns

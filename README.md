@@ -169,7 +169,7 @@ python ./datacomp/evaluate.py --train_output_dir "${train_output_dir}" --data_di
 
 If you find DRRho useful in your research, please consider citing the following paper:
 ```bibtex
-@article{wei2024fastclip,
+@article{wei2024model,
   title={Model Steering: Learning with a Reference Model Improves Generalization Bounds and Scaling Laws},
   author={Wei, Xiyuan and Lin, Ming and Ye, Fanjiang and Song, Fengguang and Cao, Liangliang and Thai, My T. and Yang, Tianbao},
   journal={arXiv preprint arXiv:2505.06699},

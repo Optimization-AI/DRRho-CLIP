@@ -2,7 +2,16 @@
 
 Paper link: [arXiv](https://arxiv.org/abs/2505.06699)
 
-We formalize an emerging learning paradigm that uses a trained model as a reference to guide and enhance the training of a target model through strategic data selection or weighting, named **model steering**. While ad-hoc methods have been used in various contexts, including the training of large foundation models, its underlying principles remain insufficiently understood, leading to sub-optimal performance. In this work, we propose a theory-driven framework for model steering called **DRRho risk minimization**, which is rooted in Distributionally Robust Optimization (DRO). Through a generalization analysis, we provide theoretical insights into why this approach improves generalization and data efficiency compared to training without a reference model. To the best of our knowledge, this is the first time such theoretical insights are provided for the new learning paradigm, which significantly enhance our understanding and practice of model steering. Building on these insights and the connection between contrastive learning and DRO, we introduce a novel method for Contrastive Language-Image Pretraining (CLIP) with a reference model, termed DRRho-CLIP. Extensive experiments validate the theoretical insights, reveal a superior scaling law compared to CLIP without a reference model, and demonstrate its strength over existing heuristic approaches.
+
+**How can we leverage public models to improve training of a target model on custom datasets?**
+
+- We formalize an emerging learning paradigm that uses a trained model as a reference to guide and enhance the training of a target model through strategic data selection or weighting, named **model steering**.
+- We propose a theory-driven framework for model steering called **DRRho risk minimization**, which is rooted in Distributionally Robust Optimization (DRO) and RHO loss.
+- We provide theoretical insights into why this approach improves generalization and data efficiency compared to training without a reference model.
+- We introduce a novel method for Contrastive Language-Image Pretraining (CLIP) with a reference model, termed DRRho-CLIP.
+- We trained a DRRho-CLIP model (ViT-B/16)  on 192M data (1.28B samples seen) in 2 days on 8 H100, achieving 5.52% improvement over a weaker reference model, i.e., OpenAI CLIP  model (ViT-B/32) that was trained on 400M data (12.8B samples seen) with 256 V100 GPUs.
+- Model steering and DRRHO risk minimization offers weak to strong generalization.
+- DRRHO-CLIP has a better scaling law than OpenCLIP. 
 
 **Table of Contents**
 - [Getting Started](#getting-started)

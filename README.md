@@ -5,6 +5,8 @@ Paper link: [arXiv](https://arxiv.org/abs/2505.06699)
 
 **How can we leverage public models to improve training of a target model on custom datasets?**
 
+**How can we perform weak to strong generalization?**
+
 - We formalize an emerging learning paradigm that uses a trained model as a reference to guide and enhance the training of a target model through strategic data selection or weighting, named **model steering**.
 - We propose a theory-driven framework for model steering called **DRRho risk minimization**, which is rooted in Distributionally Robust Optimization (DRO) and RHO loss.
 - We provide theoretical insights into why this approach improves generalization and data efficiency compared to training without a reference model.

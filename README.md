@@ -10,15 +10,26 @@ Paper link: [arXiv](https://arxiv.org/abs/2505.06699)
 - We provide theoretical insights into why this approach improves generalization and data efficiency compared to training without a reference model.
 - We introduce a novel method for Contrastive Language-Image Pretraining (CLIP) with a reference model, termed DRRho-CLIP.
 - We trained a DRRho-CLIP model (ViT-B/16)  on 192M data (1.28B samples seen) in 2 days on 8 H100, achieving 5.52% improvement over a weaker reference model, i.e., OpenAI CLIP  model (ViT-B/32) that was trained on 400M data (12.8B samples seen) with 256 V100 GPUs.
-- Model steering and DRRHO risk minimization offers weak to strong generalization.
-- DRRHO-CLIP has a better scaling law than OpenCLIP. 
+- Model steering and DRRho risk minimization offers weak to strong generalization.
+- DRRho-CLIP has a better scaling law than OpenCLIP. 
 
 **Table of Contents**
+- [Experimental Results](#experimental-results)
 - [Getting Started](#getting-started)
     - [Environment Setup](#environment-setup)
     - [Training](#training)
     - [Evaluation](#evaluation)
 - [Citing DRRho](#citing-drrho)
+
+## Experimental Results
+
+Comparison between a target model (ViT-B/16) trained by the proposed DRRho-CLIP and the reference model it leverages. OpenAI CLIP (ViT-B/32) was trained on a private 400M dataset with 12.8B samples seen and 32768 batch size. DRRho-CLIP model was trained on DFN-192M with 1.28B samples seen and 5120 batch size, and using OpenAI CLIP as a reference model.
+
+<p align="center"><img alt="Comparison between OpenAI CLIP and DRRho-CLIP" src="./assets/teaser.png" width="600"/></p>
+
+Scaling performance of OpenCLIP and the proposed DRRho-CLIP, which uses the OpenAI CLIP model (ViT-B/32) as the reference model. We conduct experiments of the two methods under different settings to fit scaling laws, as shown in the bottom left corner
+
+<p align="center"><img alt="Scaling Law of DRRho-CLIP and OpenCLIP" src="./assets/scaling_law.png" width="600"/></p>
 
 ## Getting Started
 

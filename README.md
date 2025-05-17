@@ -23,13 +23,13 @@ Paper link: [arXiv](https://arxiv.org/abs/2505.06699)
 
 ## Experimental Results
 
-Comparison between a target model (ViT-B/16) trained by the proposed DRRho-CLIP and the reference model it leverages. OpenAI CLIP (ViT-B/32) was trained on a private 400M dataset with 12.8B samples seen and 32768 batch size. DRRho-CLIP model was trained on DFN-192M with 1.28B samples seen and 5120 batch size, and using OpenAI CLIP as a reference model.
+**Weak to strong generalization**: The following figure presents a comparison between a target model (ViT-B/16) trained by the proposed DRRho-CLIP and the reference model it leverages. OpenAI CLIP (ViT-B/32) was trained on a private 400M dataset with 12.8B samples seen and 32768 batch size. DRRho-CLIP model was trained on DFN-192M with 1.28B samples seen and 5120 batch size, and using OpenAI CLIP as a reference model.
 
-<p align="center"><img alt="Comparison between OpenAI CLIP and DRRho-CLIP" src="./assets/teaser.png" width="600"/></p>
+<p align="center"><img alt="Comparison between OpenAI CLIP and DRRho-CLIP" src="./assets/teaser.png" width="400"/></p>
 
-Scaling performance of OpenCLIP and the proposed DRRho-CLIP, which uses the OpenAI CLIP model (ViT-B/32) as the reference model. We conduct experiments of the two methods under different settings to fit scaling laws, as shown in the bottom left corner
+**Scaling performance** of OpenCLIP and the proposed DRRho-CLIP, which uses the OpenAI CLIP model (ViT-B/32) as the reference model. We conduct experiments of the two methods under different settings to fit scaling laws, as shown in the bottom left corner
 
-<p align="center"><img alt="Scaling Law of DRRho-CLIP and OpenCLIP" src="./assets/scaling_law.png" width="600"/></p>
+<p align="center"><img alt="Scaling Law of DRRho-CLIP and OpenCLIP" src="./assets/scaling_law.png" width="400"/></p>
 
 ## Getting Started
 

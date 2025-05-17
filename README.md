@@ -31,6 +31,10 @@ Paper link: [arXiv](https://arxiv.org/abs/2505.06699)
 
 <p align="center"><img alt="Scaling Law of DRRho-CLIP and OpenCLIP" src="./assets/scaling_law.png" width="400"/></p>
 
+**Comparison with baselines**: Comparison of different methods on DFN-192M with 1.28B samples seen. DRRho-CLIP outperforms existing methods, and it can be effectively integrated with knowledge distillation methods.
+
+<p align="center"><img alt="Comparison with baselines" src="./assets/baselines.png" width="600"/></p>
+
 ## Getting Started
 
 ### Environment Setup
@@ -100,7 +104,7 @@ srun python -u src/training/main.py \
 
 </details>
 
-<details open>
+<details>
     <summary>Sample script to run <b>FastCLIP</b> on DFN-192M using 8 GPUs (2 nodes and 4 GPUs per node)</summary>
 
 ```bash

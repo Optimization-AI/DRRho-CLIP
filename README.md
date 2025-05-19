@@ -87,7 +87,7 @@ export HUGGINGFACE_HUB_CACHE='./checkpoints/huggingface'
 
 srun python -u src/training/main.py \
     --save-frequency 1 \
-    --train-data './datasets/dfn2b/large/shards/000{00000..19245}.tar::./datasets/dfn2b/large_disjoint/shards/000{19246..29794}.tar' \
+    --train-data './datasets/dfn2b/large/shards/000{00000..19245}.tar::./datasets/dfn2b/large_disjoint/shards/000{19246..25500}.tar' \
     --train-num-samples 192160462 --data_size 255020000 \
     --warmup 500 \
     --batch-size 640 \
@@ -135,7 +135,7 @@ export HUGGINGFACE_HUB_CACHE='./checkpoints/huggingface'
 
 srun python -u src/training/main.py \
     --save-frequency 1 \
-    --train-data './datasets/dfn2b/large/shards/000{00000..19245}.tar::./datasets/dfn2b/large_disjoint/shards/000{19246..29794}.tar' \
+    --train-data './datasets/dfn2b/large/shards/000{00000..19245}.tar::./datasets/dfn2b/large_disjoint/shards/000{19246..25500}.tar' \
     --train-num-samples 192160462 --data_size 255020000 \
     --warmup 500 \
     --batch-size 640 \

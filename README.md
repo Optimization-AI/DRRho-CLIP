@@ -67,7 +67,7 @@ We present sample slurm scripts to run DRRho-CLIP and FastCLIP on DFN-192M.
 #SBATCH --mem=120G
 #SBATCH --nodes=2
 #SBATCH --gres=gpu:4
-#SBATCH --ntasks-per-node=6
+#SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=6
 #SBATCH --wait-all-nodes=1
 #SBATCH --job-name=drrho_clip
@@ -115,7 +115,7 @@ srun python -u src/training/main.py \
 #SBATCH --mem=120G
 #SBATCH --nodes=2
 #SBATCH --gres=gpu:4
-#SBATCH --ntasks-per-node=6
+#SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=6
 #SBATCH --wait-all-nodes=1
 #SBATCH --job-name=fastclip

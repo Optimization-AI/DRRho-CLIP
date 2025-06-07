@@ -2,7 +2,7 @@
 
 Paper link: [arXiv](https://arxiv.org/abs/2505.06699)
 
-[Slides](https://tamucs-my.sharepoint.com/:p:/g/personal/tianbao-yang_tamu_edu/ERUoesdQjD1Fl_vajic6KlABBa2N8v2jbaymsRB50NJcFA?e=wL2vbr)
+[Slides](https://tamucs-my.sharepoint.com/:p:/g/personal/tianbao-yang_tamu_edu/ERUoesdQjD1Fl_vajic6KlABBa2N8v2jbaymsRB50NJcFA?e=qtZpmr)
 
 **How can we leverage public models to improve training of a target model on custom datasets?**
 

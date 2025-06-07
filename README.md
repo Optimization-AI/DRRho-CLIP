@@ -2,6 +2,7 @@
 
 Paper link: [arXiv](https://arxiv.org/abs/2505.06699)
 
+[Slides](./assets/drrho.pptx)
 
 **How can we leverage public models to improve training of a target model on custom datasets?**
 

@@ -4,6 +4,8 @@ Paper link: [arXiv](https://arxiv.org/abs/2505.06699)
 
 [Slides](https://tamucs-my.sharepoint.com/:p:/g/personal/tianbao-yang_tamu_edu/ERUoesdQjD1Fl_vajic6KlABBa2N8v2jbaymsRB50NJcFA?e=qtZpmr)
 
+Checkpoints: DRRho-CLIP ViT-B/16 (DFN-192M, 1.28B samples seen, reference model OpenAI ViT-B/32): [Hugging Face](https://huggingface.co/xwei00/DRRho-CLIP-ViT-B-16-DFN-192M-Ref-ViT-B-32)
+
 **How can we leverage public models to improve training of a target model on custom datasets?**
 
 **How can we perform weak to strong generalization?**
